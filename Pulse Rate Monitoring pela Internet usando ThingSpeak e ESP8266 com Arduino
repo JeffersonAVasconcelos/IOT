@@ -1,0 +1,202 @@
+#include <SoftwareSerial.h>
+#define DEBUG true
+SoftwareSerial esp8266(9,10);
+#include <LiquidCrystal.h>
+#include <stdlib.h>
+LiquidCrystal lcd(12,11,5,4,3,2);
+ 
+#define SSID "Alexahome" // "SSID-WiFiname"
+#define PASS "98765432" // "password"
+#define IP "184.106.153.149"// thingspeak.com ip
+String msg = "GET /update?key=W86OQNB83XEQIMN4"; //mude com sua chave de API
+ 
+//Variables
+float temp;
+int hum;
+String tempC;
+int error;
+int pulsePin = 0; // Sensor de pulso conectado ao pino analógico
+int blinkPin = 7; // pino a piscar led a cada batida
+int fadePin = 5;
+int fadeRate = 0;
+ 
+// Variáveis voláteis, usadas na rotina de serviço de interrupção!
+volatile int BPM; // int que mantém analógico bruto em 0. atualizado a cada 2 ms
+volatile int Signal; // mantém os dados brutos recebidos
+volatile int IBI = 600; // int que mantém o intervalo de tempo entre as batidas! Deve ser semeado!
+volatile boolean Pulse = false; // "Verdadeiro" quando o batimento cardíaco é detectado. "Falso" quando não é uma "batida ao vivo".
+volatile boolean QS = false; // torna-se verdadeiro quando o Arduino encontra uma batida.
+ 
+// Atenciosamente, Saída serial - Configure isso de acordo com suas necessidades
+static boolean serialVisual = true; // Definir como 'falso' por padrão.
+volatile int rate[10]; // matriz para conter os últimos dez valores IBI
+volatile unsigned long sampleCounter = 0; // usado para determinar o tempo de pulso
+volatile unsigned long lastBeatTime = 0; // costumava encontrar IBI
+volatile int P =512; // usado para encontrar o pico na onda de pulso
+volatile int T = 512; // usado para encontrar o vale na onda de pulso
+volatile int thresh = 525; // costumava encontrar o momento instantâneo de batimento cardíaco
+volatile int amp = 100; // usado para manter a amplitude da forma de onda de pulso
+volatile boolean firstBeat = true; // usado para semear a taxa
+volatile boolean secondBeat = false; // usado para semear a taxa
+ 
+void setup() 
+{
+  lcd.begin(16, 2);
+  lcd.print("Connecting...");
+  Serial.begin(9600);
+  esp8266.begin(9600);
+  Serial.println("AT");
+  esp8266.println("AT");
+  delay(5000);
+  if(esp8266.find("OK")){
+    connectWiFi();
+  }
+  interruptSetup();
+}
+ 
+void loop(){
+  lcd.clear();
+  start:
+  error=0;
+  lcd.setCursor(0, 0);
+  lcd.print("BPM = ");
+  lcd.print(BPM);
+  delay (100);
+  lcd.setCursor(0, 1); // set the cursor to column 0, line 2
+  delay(1000);
+  updatebeat();
+  if (error==1){
+    goto start; //go to label "start"
+  }
+ 
+  delay(1000);
+}
+ 
+void updatebeat(){
+  String cmd = "AT+CIPSTART=\"TCP\",\"";
+  cmd += IP;
+  cmd += "\",80";
+  Serial.println(cmd);
+  esp8266.println(cmd);
+  delay(2000);
+  if(esp8266.find("Error")){
+    return; 
+  }
+  cmd = msg ;
+  cmd += "&field1=";
+  cmd += BPM;
+  cmd += "\r\n";
+  Serial.print("AT+CIPSEND=");
+  esp8266.print("AT+CIPSEND=");
+  Serial.println(cmd.length()); 
+  esp8266.println(cmd.length());
+  if(esp8266.find(">")){
+    Serial.print(cmd);
+    esp8266.print(cmd);
+  }else{
+    Serial.println("AT+CIPCLOSE");
+    esp8266.println("AT+CIPCLOSE");
+    error=1;
+  }
+}
+  
+boolean connectWiFi(){
+  Serial.println("AT+CWMODE=1");
+  esp8266.println("AT+CWMODE=1");
+  delay(2000);
+  String cmd="AT+CWJAP=\"";
+  cmd+=SSID;
+  cmd+="\",\"";
+  cmd+=PASS;
+  cmd+="\"";
+  Serial.println(cmd);
+  esp8266.println(cmd);
+  delay(5000);
+  if(esp8266.find("OK")){
+    Serial.println("OK");
+    return true;
+  }else{
+     return false;
+  }
+}
+ 
+void interruptSetup(){
+   TCCR2A = 0x02; // DESATIVE O PWM NOS PINOS DIGITAIS 3 E 11 E ENTRE NO MODO CTC
+   TCCR2B = 0x06; // NÃO FORCE COMPARE, 256 PRESCALER
+   OCR2A = 0X7C; // AJUSTE O TOPO DA CONTAGEM PARA 124 PARA A TAXA DE AMOSTRA DE 500 Hz
+   TIMSK2 = 0x02; // ATIVAR A INTERRUPÇÃO NA CORRESPONDÊNCIA ENTRE TIMER2 E OCR2A
+   sei(); // CERTIFIQUE-SE DE QUE AS INTERRUPÇÕES GLOBAIS ESTÃO ATIVADAS
+}
+ 
+ISR(TIMER2_COMPA_vect){ // acionado quando o Timer2 conta até 124
+   cli(); // desabilite interrupções enquanto fazemos isso
+   
+   Signal = analogRead(pulsePin); // leia o sensor de pulso
+   sampleCounter += 2; // manter o controle do tempo em mS
+   int N = sampleCounter - lastBeatTime; // monitore o tempo desde a última batida para evitar ruído
+ 
+   // encontre o pico e o vale da onda de pulso
+   if(Signal < thresh && N > (IBI/5)*3){ // evite ruído dicrótico esperando 3/5 do último IBI
+      if (Signal < T){ // T é o vale
+         T = Signal; // acompanhe o ponto mais baixo da onda de pulso
+      }
+   }
+ 
+   if(Signal > thresh && Signal > P){ // condição de limiar ajuda a evitar ruído
+     P = Signal; // P é o pico
+   } // acompanhe o ponto mais alto da onda de pulso
+ 
+   if (N > 250){ // evite ruído de alta frequência
+     if ( (Signal > thresh) && (Pulse == false) && (N > (IBI/5)*3) ){
+        Pulse = true; // definir o sinalizador de pulso quando houver um pulso
+        digitalWrite(blinkPin,HIGH); // ligue o LED do pino 13
+        IBI = sampleCounter - lastBeatTime; // tempo entre batidas em mS
+        lastBeatTime = sampleCounter; // mantenha o controle do tempo para o próximo pulso
+ 
+        if(secondBeat){ // se esta é a segunda batida
+           secondBeat = false; // limpar sinalizador de secondBeat
+           for(int i=0; i<=9; i++){ // semeie o total em execução para obter um BPM realista na inicialização
+              rate[i] = IBI;
+           }
+        }
+ 
+        if(firstBeat){ // se é a primeira vez que o batimento é encontrado
+          firstBeat = false; // limpar sinalizador firstBeat
+          secondBeat = true; // definir a segunda bandeira da batida
+          sei(); // habilitar interrupções novamente
+          return; // O valor IBI não é confiável, portanto, descarte-o
+        }
+        word runningTotal = 0; // limpar a variável runningTotal
+ 
+        for(int i=0; i<=8; i++){ // deslocar dados na matriz de taxas
+           rate[i] = rate[i+1]; // e descartar o valor IBI mais antigo
+           runningTotal += rate[i]; // some os 9 valores IBI mais antigos
+        }
+ 
+        rate[9] = IBI; // adicione o IBI mais recente à matriz de taxas
+        runningTotal += rate[9]; // adicione o IBI mais recente ao runningTotal
+        runningTotal /= 10; // calcule a média dos últimos 10 valores IBI
+        BPM = 60000/runningTotal; // quantas batidas cabem em um minuto? isso é BPM!
+        QS = true; // definir sinalizador Quantified Self
+     }
+   }
+ 
+   if (Signal < thresh && Pulse == true){ // quando os valores estão caindo, a batida acaba
+      digitalWrite(blinkPin,LOW); // desligue o pino 13 LED
+      Pulse = false; // redefina a bandeira do pulso para que possamos fazer de novo
+      amp = P - T; // obter amplitude da onda de pulso
+      thresh = amp/2 + T; // definir limite em 50% da amplitude
+      P = thresh; // reinicie para a próxima vez
+      T = thresh;
+   }
+ 
+   if (N > 2500){ // se 2,5 segundos passam sem parar
+      thresh = 512; // definir limite padrão
+      P = 512; // definir P padrão
+      T = 512; // definir T padrão
+      lastBeatTime = sampleCounter; // atualize o lastBeatTime
+      firstBeat = true; // defina-os para evitar ruído
+      secondBeat = false; // quando tivermos o batimento cardíaco de volta
+   }
+   sei();
+}
